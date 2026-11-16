@@ -130,7 +130,8 @@ function escText(s) {
 // (the intervening backticks are now '+', so [^`]+ can cross them).
 function applyAnyPunct(src) {
   const n = src.length;
-  let out = '';
+  let out = null; // built lazily: only when a replacement happens
+  let copyFrom = 0; // start of the next verbatim segment
   let changed = false;
   let i = 0;
   while (i < n) {
@@ -154,27 +155,33 @@ function applyAnyPunct(src) {
         }
         if (found > 0) {
           const rawContent = src.slice(i + k, found);
-          const content = rawContent.replace(/`/g, '+');
-          if (rawContent.indexOf('`') >= 0) changed = true;
-          out += src.slice(i, i + k) + content + src.slice(found, found + k);
+          if (rawContent.indexOf('`') >= 0) {
+            if (out === null) out = src.slice(0, i);
+            else out += src.slice(copyFrom, i);
+            out += src.slice(i, i + k) + rawContent.replace(/`/g, '+') + src.slice(found, found + k);
+            copyFrom = found + k;
+            changed = true;
+          }
           i = found + k;
           continue;
         }
       }
-      out += src.slice(i, i + k);
       i += k;
       continue;
     }
     if (c === 92 && i + 1 < n && isAsciiPunct(src[i + 1])) { // escaped punct -> ++
+      if (out === null) out = src.slice(0, i);
+      else out += src.slice(copyFrom, i);
       out += '++';
+      copyFrom = i + 2;
       changed = true;
       i += 2;
       continue;
     }
-    out += src[i];
     i++;
   }
-  return changed ? out : src;
+  if (!changed) return src;
+  return out + src.slice(copyFrom);
 }
 
 // Compute the spans masked by marked's inline blockSkip rule
@@ -316,6 +323,24 @@ function maskSource(src, spans) {
 function computeLastDelimIdx(src, spans) {
   const last = { '*': -1, '_': -1, '~': -1 };
   const n = src.length;
+  if (spans.length === 0) {
+    // No masked spans: the last run of each char, preceding char
+    // not whitespace.
+    let i = 0;
+    while (i < n) {
+      const c = src[i];
+      if (c === '*' || c === '_' || c === '~') {
+        let j = i;
+        while (j < n && src[j] === c) j++;
+        const o = i === 0 ? '\n' : src[i - 1];
+        if (o !== ' ' && o !== '\t' && o !== '\n' && o !== '\r' && o !== '\f') last[c] = i;
+        i = j;
+        continue;
+      }
+      i++;
+    }
+    return last;
+  }
   // span ends, sorted (spans are sorted and non-overlapping).
   const ends = new Set(spans.map(s => s[1]));
   let i = 0;
@@ -1270,6 +1295,7 @@ function scanInline(src, ctx) {
     lastIdx = { '*': 1e9, '_': 1e9, '~': 1e9 };
   }
   const n = src.length;
+  const hasMasked = masked.length > 0;
   let i = 0;
   let ts = 0;
   const flush = (end) => {
@@ -1354,7 +1380,7 @@ function scanInline(src, ctx) {
         // the anyPunct + blockSkip pipeline) is not an emphasis
         // delimiter at all: marked's masked source hides it. Leave
         // it in the running text (do not flush; ts stays put).
-        if (isMasked(masked, rawStart)) { i += len; continue; }
+        if (hasMasked && isMasked(masked, rawStart)) { i += len; continue; }
         flush(i);
         delims.push({ ch, idx: parts.length, len, olen: len, prev, next, open, close, active: true, pos: rawStart });
         parts.push({ t: 6, ch, len });
@@ -1372,7 +1398,7 @@ function scanInline(src, ctx) {
       if (fl.left || fl.right) {
         let rawStart = i;
         while (rawStart > 0 && src.charCodeAt(rawStart - 1) === 126) rawStart--;
-        if (isMasked(masked, rawStart)) { i += len; continue; }
+        if (hasMasked && isMasked(masked, rawStart)) { i += len; continue; }
         flush(i);
         delims.push({ ch: '~', idx: parts.length, len, olen: len, prev, next, open: fl.left, close: fl.right, active: true, pos: rawStart });
         parts.push({ t: 6, ch: '~', len });
