@@ -122,6 +122,224 @@ function escText(s) {
   return out;
 }
 
+// Replicates marked's anyPunctuationOutsideCode replacement: code
+// spans keep their delimiter backticks but have inner backticks
+// neutralised to '+'; an escaped punctuation char becomes '++';
+// bare backtick runs are unchanged. This runs BEFORE blockSkip, so
+// a backtick run inside a link label can pair with a distant run
+// (the intervening backticks are now '+', so [^`]+ can cross them).
+function applyAnyPunct(src) {
+  const n = src.length;
+  let out = '';
+  let changed = false;
+  let i = 0;
+  while (i < n) {
+    const c = src.charCodeAt(i);
+    if (c === 96) { // backtick run: try a code span
+      let k = 0;
+      while (i + k < n && src.charCodeAt(i + k) === 96) k++;
+      let j = i + k;
+      if (j < n && src.charCodeAt(j) !== 96) {
+        // Find the first run of exactly k backticks not followed by
+        // a backtick (non-greedy content: starts and ends non-backtick).
+        let found = -1;
+        let p = j;
+        while (p < n) {
+          if (src.charCodeAt(p) === 96) {
+            let m = 0;
+            while (p + m < n && src.charCodeAt(p + m) === 96) m++;
+            if (m === k && (p + m >= n || src.charCodeAt(p + m) !== 96) && p > j) { found = p; break; }
+            p += m;
+          } else p++;
+        }
+        if (found > 0) {
+          const rawContent = src.slice(i + k, found);
+          const content = rawContent.replace(/`/g, '+');
+          if (rawContent.indexOf('`') >= 0) changed = true;
+          out += src.slice(i, i + k) + content + src.slice(found, found + k);
+          i = found + k;
+          continue;
+        }
+      }
+      out += src.slice(i, i + k);
+      i += k;
+      continue;
+    }
+    if (c === 92 && i + 1 < n && isAsciiPunct(src[i + 1])) { // escaped punct -> ++
+      out += '++';
+      changed = true;
+      i += 2;
+      continue;
+    }
+    out += src[i];
+    i++;
+  }
+  return changed ? out : src;
+}
+
+// Compute the spans masked by marked's inline blockSkip rule
+// (link | code | html, scanned left to right). A code span inside a
+// link label that does not close makes the whole link alternative
+// fail, so the dangling backtick pairs with a later one and swallows
+// any emphasis delims between them. Delims inside a masked span are
+// not emphasis delims. Returns a sorted array of [start, end).
+function computeMaskedSpans(src) {
+  const spans = [];
+  const n = src.length;
+  let i = 0;
+  const codeEnd = (s, p) => {
+    // Match (?<b>`+)[^`]+\k<b>(?!`) at p. Returns end index or -1.
+    let k = 0;
+    while (p + k < n && s.charCodeAt(p + k) === 96) k++;
+    if (k === 0) return -1;
+    let j = p + k;
+    const start = j;
+    while (j < n && s.charCodeAt(j) !== 96) j++;
+    if (j === start) return -1; // [^`]+ needs at least one char
+    // j is at a backtick; count the run
+    let m = 0;
+    while (j + m < n && s.charCodeAt(j + m) === 96) m++;
+    if (m !== k) return -1;
+    if (j + m < n && s.charCodeAt(j + m) === 96) return -1; // (?!`) already covered by m
+    return j + m;
+  };
+  const linkEnd = (s, p) => {
+    // Match the blockSkip link alternative at p (s[p] === '[').
+    // Returns end index (after the closing ')') or -1.
+    let j = p + 1;
+    while (j < n) {
+      const c = s.charCodeAt(j);
+      if (c === 96) {
+        const e = codeEnd(s, j);
+        if (e < 0) return -1;
+        j = e;
+        continue;
+      }
+      if (c === 91) return -1; // '[' not allowed in the label
+      if (c === 93) { // ']'
+        if (j + 1 < n && s.charCodeAt(j + 1) === 40) { j += 2; break; }
+        return -1;
+      }
+      j++;
+    }
+    if (j >= n) return -1;
+    // Destination: (?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*
+    while (j < n) {
+      const c = s.charCodeAt(j);
+      if (c === 92) { if (j + 1 >= n) return -1; j += 2; continue; }
+      if (c === 41) return j + 1; // ')'
+      if (c === 40) {
+        j++;
+        let closed = false;
+        while (j < n) {
+          const d = s.charCodeAt(j);
+          if (d === 92) { if (j + 1 >= n) return -1; j += 2; continue; }
+          if (d === 41) { j++; closed = true; break; }
+          if (d === 40) return -1; // only one level of nesting
+          j++;
+        }
+        if (!closed) return -1;
+        continue;
+      }
+      j++;
+    }
+    return -1;
+  };
+  const htmlEnd = (s, p) => {
+    // Match <(?! )[^<>]*?> at p.
+    if (p + 1 < n && s.charCodeAt(p + 1) === 32) return -1;
+    let j = p + 1;
+    while (j < n) {
+      const c = s.charCodeAt(j);
+      if (c === 60) return -1;
+      if (c === 62) return j + 1;
+      j++;
+    }
+    return -1;
+  };
+  while (i < n) {
+    const c = src.charCodeAt(i);
+    if (c === 91) { // [
+      const e = linkEnd(src, i);
+      if (e > 0) { spans.push([i, e]); i = e; continue; }
+      i++;
+      continue;
+    }
+    if (c === 96 && (i === 0 || src.charCodeAt(i - 1) !== 96)) { // ` not preceded by `
+      const e = codeEnd(src, i);
+      if (e > 0) { spans.push([i, e]); i = e; continue; }
+      i++;
+      continue;
+    }
+    if (c === 60) { // <
+      const e = htmlEnd(src, i);
+      if (e > 0) { spans.push([i, e]); i = e; continue; }
+      i++;
+      continue;
+    }
+    i++;
+  }
+  return spans;
+}
+function isMasked(spans, pos) {
+  // spans is sorted and non-overlapping; binary search.
+  let lo = 0, hi = spans.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const s = spans[mid];
+    if (pos < s[0]) hi = mid - 1;
+    else if (pos >= s[1]) lo = mid + 1;
+    else return true;
+  }
+  return false;
+}
+// Build the masked source: each blockSkip span is replaced by '[' +
+// 'a's + ']' (same length, so indices still line up). Mirrors
+// marked's blockSkip replacement.
+function maskSource(src, spans) {
+  let out = '';
+  let last = 0;
+  for (const [s, e] of spans) {
+    out += src.slice(last, s);
+    out += '[' + 'a'.repeat(Math.max(0, e - s - 2)) + ']';
+    last = e;
+  }
+  out += src.slice(last);
+  return out;
+}
+// Marked's fe: for each of `*`, `_`, `~`, the start index of the
+// LAST run of that char in the masked source whose preceding char is
+// not whitespace. Computed directly from src + spans (no masked
+// string built): a run start inside a span is invisible; the char
+// before a run that starts right at a span end is ']' in the masked
+// source, otherwise it is the source char.
+function computeLastDelimIdx(src, spans) {
+  const last = { '*': -1, '_': -1, '~': -1 };
+  const n = src.length;
+  // span ends, sorted (spans are sorted and non-overlapping).
+  const ends = new Set(spans.map(s => s[1]));
+  let i = 0;
+  while (i < n) {
+    const c = src[i];
+    if (c === '*' || c === '_' || c === '~') {
+      let j = i;
+      while (j < n && src[j] === c) j++;
+      if (!isMasked(spans, i)) {
+        // Preceding char in the masked source.
+        let o;
+        if (i === 0) o = '\n';
+        else if (ends.has(i)) o = ']';
+        else o = src[i - 1];
+        if (o !== ' ' && o !== '\t' && o !== '\n' && o !== '\r' && o !== '\f') last[c] = i;
+      }
+      i = j;
+      continue;
+    }
+    i++;
+  }
+  return last;
+}
+
 // Escape for contexts where every `&`, `<`, `>`, `"` and `'` is encoded
 // (code spans, autolink text and hrefs).
 function escEncode(s) {
@@ -252,6 +470,24 @@ function trimTrailingBlankLines(str) {
   return lines.slice(0, end + 1).join('\n');
 }
 
+// Expand tabs in the leading whitespace run of `line` only. Tabs after
+// the first non-whitespace character (e.g. after a `>` blockquote
+// marker) are left alone: the inner block parser expands them relative
+// to the marker's column (marked's blockquoteMarkerWhitespace), and
+// expanding them against the outer column is wrong there.
+function expandLeadingTabs(line) {
+  let col = 0;
+  let out = '';
+  let i = 0;
+  while (i < line.length) {
+    const ch = line[i];
+    if (ch === ' ') { out += ch; col++; i++; }
+    else if (ch === '\t') { const add = 4 - (col % 4); out += ' '.repeat(add); col += add; i++; }
+    else break;
+  }
+  return out + line.slice(i);
+}
+
 // Expand tabs in `line` to spaces, tracking the column from `indent`.
 function expandTabs(line, indent) {
   let col = indent || 0;
@@ -346,9 +582,13 @@ function flankInfo(prev, next, forDel) {
   const nextCls = next === '' ? 1 : cls(next);
   const prevPunct = forDel ? prevCls === 2 : (prevCls === 2 && prev !== '~');
   const nextPunct = forDel ? nextCls === 2 : (nextCls === 2 && next !== '~');
+  // `~` is punctuation for the right/close side (a `*`/`_` run immediately
+  // before `~~` is a closer, e.g. `**or large ©**~~`), but not for the
+  // left side (a run before `~` can still open, e.g. `*~foo~*`).
+  const nextPunctClose = nextCls === 2;
   const left = nextCls !== 1 && (!nextPunct || prevCls === 1 || prevPunct);
-  const right = prevCls !== 1 && (!prevPunct || nextCls === 1 || nextPunct);
-  return { left, right, prevPunct, nextPunct };
+  const right = prevCls !== 1 && (!prevPunct || nextCls === 1 || nextPunctClose);
+  return { left, right, prevPunct, nextPunct, nextPunctClose };
 }
 
 // A raw HTML tag starting at `i` in `src`: returns its length, or 0 when
@@ -512,7 +752,23 @@ function isEmail(s) {
 // GFM extended autolink starting at `i`: www./http(s)://ftp:// or an
 // email address. Returns {len, href, text} or null. `prevCh` is the
 // character before `i` ('' at the start).
-function matchUrl(src, i, prevCh) {
+// Relaxed bare-email match: marked's email regex with a trailing lookahead
+// that excludes `_` and `*` as well. Marked tokenizes an emphasis span's
+// inner text without the closing delimiter, so its email regex never sees
+// the trailing `_`/`*`; ours scans the raw text and stops a domain label
+// early (or fails outright). Only use the longer match when the char after
+// it is `_`/`*` AND an open delimiter of that char is pending.
+const _reEmailLong = /^[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![A-Za-z0-9-])/;
+function relaxEmail(src, i, strictLen, delims) {
+  if (!delims) return strictLen;
+  const rel = _reEmailLong.exec(src.slice(i));
+  if (!rel || rel[0].length <= strictLen) return strictLen;
+  const after = src[i + rel[0].length];
+  if ((after === '_' || after === '*') && delims.some(d => d.active && d.open && d.ch === after)) return rel[0].length;
+  return strictLen;
+}
+
+function matchUrl(src, i, prevCh, delims) {
   const n = src.length;
   // mailto: / xmpp: + email
   if (src.startsWith('mailto:', i) || src.startsWith('xmpp:', i)) {
@@ -520,7 +776,7 @@ function matchUrl(src, i, prevCh) {
     const rest = src.slice(i + proto.length);
     const m = /^[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])/.exec(rest);
     if (m) {
-      let len = proto.length + m[0].length;
+      let len = proto.length + relaxEmail(src, i + proto.length, m[0].length, delims);
       // xmpp: may carry a single resource path /[A-Za-z0-9@.]+
       // (one segment only; a second `/` is not part of the link).
       if (proto === 'xmpp:') {
@@ -576,8 +832,10 @@ function matchUrl(src, i, prevCh) {
   }
   // bare email
   const m = /^[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])/.exec(src.slice(i));
-  if (m) {
-    return { len: m[0].length, href: 'mailto:' + m[0], text: m[0] };
+  const len = relaxEmail(src, i, m ? m[0].length : 0, delims);
+  if (len > 0) {
+    const email = src.slice(i, i + len);
+    return { len, href: 'mailto:' + email, text: email };
   }
   return null;
 }
@@ -639,21 +897,38 @@ function parseLabel(src, i) {
     if (c === 96) { // backtick: skip a code span if it closes
       let k = 0;
       while (j + k < n && src.charCodeAt(j + k) === 96) k++;
+      // A run immediately before the label-ending `]` (depth 0, and
+      // that `]` starts a link continuation) is label content, not
+      // a code span opener: marked's `` `+(?=\]) `` alternative
+      // wins over a code span that would swallow the label end.
+      if (depth === 0 && j + k < n && src.charCodeAt(j + k) === 93) {
+        const ab = j + k + 1;
+        if (ab >= n || src.charCodeAt(ab) === 40 || src.charCodeAt(ab) === 91) {
+          if (k >= 2) { j += k; continue; }
+          return null;
+        }
+      }
+      // Marked's label regex treats a backtick run + non-backtick
+      // content + any backtick run as a code span (the closing run
+      // need not match the opening length, e.g. `` ``url` ``), so
+      // the first backtick run after the opener closes it.
       let m = j + k;
       let found = -1;
       while (m < n) {
         if (src.charCodeAt(m) === 96) {
           let r = 0;
           while (m + r < n && src.charCodeAt(m + r) === 96) r++;
-          if (r === k) { found = m + r; break; }
-          m += r;
-        } else m++;
+          found = m + r;
+          break;
+        }
+        m++;
       }
       if (found >= 0) { j = found; continue; }
-      // a run of 2+ backticks right before `]` is label content
+      // No closer: a run of 2+ backticks right before `]` is label
+      // content; anything else fails the label (marked's label
+      // regex cannot match the backtick at all).
       if (k >= 2 && j + k < n && src.charCodeAt(j + k) === 93) { j += k; continue; }
-      j += k;
-      continue;
+      return null;
     }
     if (c === 91) { // [
       if (depth >= 2) return null;
@@ -973,6 +1248,27 @@ function escP(s) {
 function scanInline(src, ctx) {
   const parts = [];
   const delims = [];
+  // Marked's masking pipeline (#n): anyPunctuationOutsideCode first,
+  // then blockSkip; fe (last visible delim run) is read off the
+  // final masked source. All replacements preserve length, so the
+  // indices still line up with src. Fast path: no emphasis delims
+  // means no masking can matter.
+  let masked = null;
+  let lastIdx = null;
+  if (src.indexOf('*') >= 0 || src.indexOf('_') >= 0 || src.indexOf('~') >= 0) {
+    const intermediate = (src.indexOf('`') >= 0 || src.indexOf('\\') >= 0) ? applyAnyPunct(src) : src;
+    // No backtick / [ / < means blockSkip can match nothing.
+    if (intermediate.indexOf('`') >= 0 || intermediate.indexOf('[') >= 0 || intermediate.indexOf('<') >= 0) {
+      masked = computeMaskedSpans(intermediate);
+      lastIdx = computeLastDelimIdx(intermediate, masked);
+    } else {
+      masked = [];
+      lastIdx = { '*': 1e9, '_': 1e9, '~': 1e9 };
+    }
+  } else {
+    masked = [];
+    lastIdx = { '*': 1e9, '_': 1e9, '~': 1e9 };
+  }
   const n = src.length;
   let i = 0;
   let ts = 0;
@@ -1047,10 +1343,20 @@ function scanInline(src, ctx) {
       let open;
       let close;
       if (ch === '*') { open = fl.left; close = fl.right; }
-      else { open = fl.left && (!fl.right || fl.prevPunct); close = fl.right && (!fl.left || fl.nextPunct); }
+      else { open = fl.left && (!fl.right || fl.prevPunct); close = fl.right && (!fl.left || fl.nextPunctClose); }
       if (open || close) {
+        // pos is the RAW run start in the source (scanning back over
+        // same-char chars, which may include an escaped one): the fe
+        // bound compares raw run starts.
+        let rawStart = i;
+        while (rawStart > 0 && src.charCodeAt(rawStart - 1) === c) rawStart--;
+        // A delimiter inside a masked span (link/code/html, after
+        // the anyPunct + blockSkip pipeline) is not an emphasis
+        // delimiter at all: marked's masked source hides it. Leave
+        // it in the running text (do not flush; ts stays put).
+        if (isMasked(masked, rawStart)) { i += len; continue; }
         flush(i);
-        delims.push({ ch, idx: parts.length, len, open, close, active: true });
+        delims.push({ ch, idx: parts.length, len, olen: len, prev, next, open, close, active: true, pos: rawStart });
         parts.push({ t: 6, ch, len });
         i += len; ts = i; continue;
       }
@@ -1064,8 +1370,11 @@ function scanInline(src, ctx) {
       const next = i + len < n ? src[i + len] : '';
       const fl = flankInfo(prev, next, true);
       if (fl.left || fl.right) {
+        let rawStart = i;
+        while (rawStart > 0 && src.charCodeAt(rawStart - 1) === 126) rawStart--;
+        if (isMasked(masked, rawStart)) { i += len; continue; }
         flush(i);
-        delims.push({ ch: '~', idx: parts.length, len, open: fl.left, close: fl.right, active: true });
+        delims.push({ ch: '~', idx: parts.length, len, olen: len, prev, next, open: fl.left, close: fl.right, active: true, pos: rawStart });
         parts.push({ t: 6, ch: '~', len });
         i += len; ts = i; continue;
       }
@@ -1074,7 +1383,7 @@ function scanInline(src, ctx) {
     }
     if (c === 119 || c === 104 || c === 102 || c === 109) { // w h f m: GFM autolink
       const prevCh = i > 0 ? src[i - 1] : '';
-      const url = matchUrl(src, i, prevCh);
+      const url = matchUrl(src, i, prevCh, delims);
       // No autolink inside a link (nested links are not allowed).
       if (url && !ctx.inLink) { flush(i); parts.push({ t: 3, href: url.href, s: url.text }); i += url.len; ts = i; continue; }
       i++;
@@ -1083,7 +1392,7 @@ function scanInline(src, ctx) {
     if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)) { // email start?
       const prevCh = i > 0 ? src[i - 1] : '';
       if (prevCh === '' || 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._%+-'.indexOf(prevCh) < 0) {
-        const url = matchUrl(src, i, prevCh);
+        const url = matchUrl(src, i, prevCh, delims);
         // No autolink inside a link (nested links are not allowed).
         if (url && !ctx.inLink) { flush(i); parts.push({ t: 3, href: url.href, s: url.text }); i += url.len; ts = i; continue; }
       }
@@ -1093,63 +1402,255 @@ function scanInline(src, ctx) {
     i++;
   }
   flush(n);
-  resolveEmphasis(parts, delims);
+  resolveEmphasis(parts, delims, lastIdx);
   return parts;
 }
 
-// Resolve emphasis/delimiter runs in `parts` using the CommonMark
-// process-emphasis algorithm: scan closers in order, match each with the
-// nearest earlier opener of the same character, honouring the odd-match
-// rule (a closer that can also open, matched with an opener that can
-// also close, is skipped when the summed lengths are a multiple of 3
-// and the opener's length is not). `~` pairs only match equal lengths.
-function resolveEmphasis(parts, delims) {
-  let ci = 0;
-  while (ci < delims.length) {
-    const closer = delims[ci];
-    if (!closer.active || !closer.close) { ci++; continue; }
-    let oi = ci - 1;
-    let opener = null;
-    while (oi >= 0) {
-      const d = delims[oi];
-      if (d.ch === closer.ch && d.active && d.open) {
-        // Odd-match rule (spec rule 9): if either delimiter can
-        // both open and close, and the lengths sum to a multiple
-        // of 3, the opener must also be a multiple of 3, else
-        // skip it.
-        const both = (d.open && d.close) || (closer.open && closer.close);
-        if (closer.ch !== '~' && both && (d.len + closer.len) % 3 === 0 && d.len % 3 !== 0) { oi--; continue; }
-        opener = d;
-        break;
+// Forward scan from `opener` (a `*`/`_` delim at index oi): find the
+// first later delimiter of the same char that pairs with it, using
+// marked's emStrong counting. The opener is tried at each length
+// from its current length down to 1 (marked's lexer retries at the
+// next character when a longer run fails to match); `m` starts at
+// the tried length and `y` at the opener's ORIGINAL length.
+// Intermediate runs and the closer count at their full length:
+// nothing past the opener has been consumed yet in this
+// left-to-right pass. Returns { ci, k, m, f, b } (the closer's
+// delim index, the opener length that matched, the final count,
+// the odd-match accumulation, the closer run's length) or null.
+function scanForward(opener, delims, oi, lastIdx) {
+  const ch = opener.ch;
+  const y = opener.olen;
+  // R: the opener is a "right-flanking" opener (preceded by a
+  // non-space and (followed by punctuation or (`*` and the preceding
+  // char is not `*`/`_` or punctuation))): then every closer
+  // candidate goes through the odd-match branch first. Computed
+  // from the full run's context, so it is the same for every tried
+  // length.
+  const p = opener.prev;
+  let R = false;
+  if (p !== '' && !isSpaceCh(p)) {
+    const nx = opener.next;
+    const d = (nx !== '' && nx !== opener.ch && isPunctCh(nx) && nx !== '~') ? nx : '';
+    const h = p === '*' || p === '_' || isPunctCh(p);
+    R = d !== '' || (opener.ch === '*' && !h);
+  }
+  // Marked's emStrong RDelim regex skips one same-char run that sits
+  // inside the opposite pair's span: a single `*` inside `__...__`
+  // (for `*` scans), a single `_` inside `**...**` (for `_` scans).
+  // The span must start at the first opposite-pair run after the
+  // opener, contain exactly one same-char run of length 1, and close
+  // at the next opposite-pair run; any other `*`/`_` run in between
+  // breaks the pattern (the regex prefix cannot cross `*` or `_`).
+  // The region is a property of the text after the opener, so it is
+  // computed over all following delims, not just up to the closer:
+  // if the closer itself is the skipped run, the scan never sees it.
+  let skipIdx = -1;
+  {
+    const other = ch === '*' ? '_' : '*';
+    for (let k = oi + 1; k < delims.length; k++) {
+      const D = delims[k];
+      if (D.ch !== '*' && D.ch !== '_') continue;
+      if (D.ch === other && D.olen >= 2) {
+        let s1 = -1;
+        for (let j = k + 1; j < delims.length; j++) {
+          const E = delims[j];
+          if (E.ch !== '*' && E.ch !== '_') continue;
+          if (E.ch === ch && E.olen === 1) s1 = j;
+          break;
+        }
+        if (s1 >= 0) {
+          for (let j = s1 + 1; j < delims.length; j++) {
+            const E = delims[j];
+            if (E.ch !== '*' && E.ch !== '_') continue;
+            if (E.ch === other && E.olen >= 2) skipIdx = s1;
+            break;
+          }
+        }
       }
-      oi--;
+      break; // the first `*`/`_` run after the opener decides
     }
-    if (!opener) { ci++; continue; }
-    const openerDelimIdx = oi;
-    let use;
-    if (closer.ch === '~') {
-      // A del needs equal lengths, and only 1 or 2 tildes; a run of
-      // 3+ never strikes (e.g. `~~~b~~~` stays literal).
-      if (opener.len !== closer.len || opener.len > 2) { ci++; continue; }
-      use = opener.len;
+  }
+  for (let k = opener.len; k >= 1; k--) {
+    let m = k;
+    let f = 0;
+    for (let j = oi + 1; j < delims.length; j++) {
+      const D = delims[j];
+      if (D.ch !== ch) continue;
+      if (j === skipIdx) continue; // skipped by the opposite-pair span
+      if (!D.active) continue;
+      // Marked's emStrong closer search stops past the last visible
+      // run of this char in the masked source (fe bound).
+      if (lastIdx && D.pos !== undefined && D.pos > lastIdx[ch]) continue;
+      if (!D.open && !D.close) continue;
+      const b = D.olen;
+      if (D.open && !D.close) { m += b; continue; }
+      if (!D.close) continue;
+      const followedByWs = D.next === '' || isSpaceCh(D.next);
+      if ((D.open && D.close && !followedByWs) || R) {
+        if (y % 3 !== 0 && (y + b) % 3 === 0) { f += b; continue; }
+      }
+      m -= b;
+      if (m > 0) continue;
+      // m <= 0: D is the match, unless rule 9 bars this length.
+      const both = (opener.open && opener.close) || (D.open && D.close);
+      if (both && (k + D.len) % 3 === 0 && k % 3 !== 0) continue;
+      return { ci: j, k, m, f, b };
+    }
+    // No match at this length; retry with one fewer delimiter char.
+  }
+  return null;
+}
+
+// Forward scan for a `~` opener: marked's del counting. Only runs
+// of the same length count; open runs add, close runs subtract; the
+// match is the first closer where the count reaches <= 0. The
+// opener is tried at each length from its current length down to 1
+// (a run of 3+ never strikes, so lengths above 2 are skipped).
+function scanForwardTilde(opener, delims, oi, lastIdx) {
+  for (let k = opener.len; k >= 1; k--) {
+    if (k > 2) continue;
+    let p = k;
+    for (let j = oi + 1; j < delims.length; j++) {
+      const D = delims[j];
+      if (D.ch !== '~') continue;
+      if (!D.active) continue;
+      // Marked's del closer search stops past the last visible `~`
+      // run in the masked source (Me bound).
+      if (lastIdx && D.pos !== undefined && D.pos > lastIdx['~']) continue;
+      if (D.len !== k) continue;
+      if (!D.open && !D.close) continue;
+      if (D.open && !D.close) { p += D.len; continue; }
+      if (!D.close) continue;
+      p -= D.len;
+      if (p > 0) continue;
+      return { ci: j, k };
+    }
+  }
+  return null;
+}
+
+// The first (or last) source character of parts[from..to] for
+// flanking purposes. Returns '' when the range is empty.
+function edgeChar(parts, from, to, first) {
+  if (first) {
+    for (let i = from; i <= to; i++) {
+      const p = parts[i];
+      if (!p) continue;
+      if (p.t === 0 && p.s.length) return p.s[0];
+      if (p.t === 1) return '`';
+      if (p.t === 2 && p.s.length) return p.s[0];
+      if (p.t === 3) return '<';
+      if (p.t === 4) return '[';
+      if (p.t === 5) return '!';
+      if (p.t === 6) return p.ch;
+      if (p.t === 8) return ' ';
+    }
+    return '';
+  }
+  for (let i = to; i >= from; i--) {
+    const p = parts[i];
+    if (!p) continue;
+    if (p.t === 0 && p.s.length) return p.s[p.s.length - 1];
+    if (p.t === 1) return '`';
+    if (p.t === 2 && p.s.length) return p.s[p.s.length - 1];
+    if (p.t === 3) return '>';
+    if (p.t === 4) return ']';
+    if (p.t === 5) return ']';
+    if (p.t === 6) return p.ch;
+    if (p.t === 8) return ' ';
+  }
+  return '';
+}
+
+// Resolve emphasis/delimiter runs in `parts` using marked's
+// left-to-right model: scan openers in order, match each with the
+// first closer its forward scan reaches, and resolve the inner
+// content recursively (marked re-lexes the token's inner text).
+// The token's tag comes from min(opener, closer) parity (odd = em,
+// even = strong); the runs' unused chars join the inner content
+// and are re-lexed there, the opener's retry-skipped chars stay
+// literal before the node, and a closer overshoot stays literal
+// after it. `~` pairs use marked's del counting (equal lengths).
+function resolveEmphasis(parts, delims, lastIdx) {
+  let oi = 0;
+  while (oi < delims.length) {
+    const opener = delims[oi];
+    if (!opener.active || !opener.open) { oi++; continue; }
+    let hit = null;
+    let tag = '';
+    let strip = 0;
+    let innerOpenLen = 0;
+    let innerCloseLen = 0;
+    let afterCloseLen = 0;
+    if (opener.ch === '~') {
+      const h = scanForwardTilde(opener, delims, oi, lastIdx);
+      if (h) { hit = h; tag = 'del'; strip = h.k; }
     } else {
-      use = (opener.len >= 2 && closer.len >= 2) ? 2 : 1;
+      const h = scanForward(opener, delims, oi, lastIdx);
+      if (h) {
+        hit = h;
+        const bEff = Math.min(h.b, h.b + h.m + h.f);
+        strip = (Math.min(h.k, bEff) % 2 === 1) ? 1 : 2;
+        tag = strip === 1 ? 'em' : 'strong';
+        innerOpenLen = h.k - strip;
+        innerCloseLen = bEff - strip;
+        afterCloseLen = h.b - bEff;
+      }
     }
-    const tag = closer.ch === '~' ? 'del' : (use === 2 ? 'strong' : 'em');
+    if (!hit) { oi++; continue; }
+    const closer = delims[hit.ci];
     const oiIdx = opener.idx;
     const ciIdx = closer.idx;
-    const inner = parts.slice(oiIdx + 1, ciIdx);
+    const contentFrom = oiIdx + 1;
+    const contentTo = ciIdx - 1;
+    const firstCh = edgeChar(parts, contentFrom, contentTo, true);
+    const lastCh = edgeChar(parts, contentFrom, contentTo, false);
+    // Inner content: the opener's unused chars, the text between
+    // the runs, the closer's unused chars — all re-lexed by
+    // recursion, as marked re-lexes the token text. The leading
+    // and trailing leftover runs are fresh runs at the inner
+    // text's edges (prev/next '' there).
+    const inner = [];
+    const innerDelims = [];
+    if (innerOpenLen > 0) {
+      const nx = firstCh !== '' ? firstCh : closer.ch;
+      const fl = flankInfo('', nx, false);
+      let open, close;
+      if (opener.ch === '*') { open = fl.left; close = fl.right; }
+      else { open = fl.left && (!fl.right || fl.prevPunct); close = fl.right && (!fl.left || fl.nextPunctClose); }
+      inner.push({ t: 6, ch: opener.ch, len: innerOpenLen });
+      innerDelims.push({ ch: opener.ch, idx: 0, len: innerOpenLen, olen: innerOpenLen, prev: '', next: nx, open, close, active: true, pos: opener.pos });
+    }
+    const innerShift = innerOpenLen > 0 ? 1 : 0;
+    for (let k = oi + 1; k < hit.ci; k++) {
+      const d = delims[k];
+      innerDelims.push({ ch: d.ch, idx: d.idx - contentFrom + innerShift, len: d.len, olen: d.olen, prev: d.prev, next: d.next, open: d.open, close: d.close, active: d.active, pos: d.pos });
+    }
+    for (let i = contentFrom; i <= contentTo; i++) inner.push(parts[i]);
+    if (innerCloseLen > 0) {
+      const pv = lastCh !== '' ? lastCh : opener.ch;
+      const fl = flankInfo(pv, '', false);
+      let open, close;
+      if (closer.ch === '*') { open = fl.left; close = fl.right; }
+      else { open = fl.left && (!fl.right || fl.prevPunct); close = fl.right && (!fl.left || fl.nextPunctClose); }
+      inner.push({ t: 6, ch: closer.ch, len: innerCloseLen });
+      innerDelims.push({ ch: closer.ch, idx: inner.length - 1, len: innerCloseLen, olen: innerCloseLen, prev: pv, next: '', open, close, active: true, pos: closer.pos });
+    }
+    resolveEmphasis(inner, innerDelims, lastIdx);
     const node = { t: 7, tag, parts: inner };
+    // Replace the span [oiIdx..ciIdx] with the retry-skipped
+    // opener chars (literal), the node, and the closer overshoot
+    // (literal, still active as a delimiter).
     const rep = [];
-    if (opener.len > use) rep.push({ t: 6, ch: opener.ch, len: opener.len - use });
+    const retrySkipped = opener.len - hit.k;
+    if (retrySkipped > 0) rep.push({ t: 6, ch: opener.ch, len: retrySkipped });
     rep.push(node);
-    if (closer.len > use) rep.push({ t: 6, ch: closer.ch, len: closer.len - use });
+    if (afterCloseLen > 0) rep.push({ t: 6, ch: closer.ch, len: afterCloseLen });
     const removed = ciIdx - oiIdx + 1;
     parts.splice(oiIdx, removed, ...rep);
     const delta = rep.length - removed;
-    if (opener.len > use) { opener.len -= use; opener.idx = oiIdx; }
-    else opener.active = false;
-    if (closer.len > use) { closer.len -= use; closer.idx = oiIdx + rep.length - 1; }
+    opener.active = false;
+    if (afterCloseLen > 0) { closer.len = afterCloseLen; closer.idx = oiIdx + rep.length - 1; }
     else closer.active = false;
     for (let k = 0; k < delims.length; k++) {
       const d = delims[k];
@@ -1158,11 +1659,11 @@ function resolveEmphasis(parts, delims) {
     }
     // Delimiters between the opener and the closer are now inside
     // the emphasis node; they can no longer pair with anything
-    // outside it (e.g. `*foo _bar* baz_`: the `_` before `bar`
-    // must not pair with the trailing `_`).
-    for (let k = openerDelimIdx + 1; k < ci; k++) delims[k].active = false;
-    if (closer.active) continue; // leftover closer may match an earlier opener
-    ci++;
+    // outside it.
+    for (let k = oi + 1; k < hit.ci; k++) delims[k].active = false;
+    // Continue at the closer: a leftover closer stays active and
+    // may open; otherwise the loop skips past it.
+    oi = hit.ci;
   }
 }
 
@@ -1262,7 +1763,12 @@ function dedentCode(line) {
 }
 
 function freshCtx(defs) {
-  return { defs, inLink: false, linkEmitted: false, inRawBlock: false };
+  // Marked keeps `inLink` as document-wide state (it is only reset for
+  // `inRawBlock`, never for `inLink`): an unclosed <a> suppresses every
+  // later autolink in the document. Back it by the per-document defs map.
+  return { defs, linkEmitted: false, inRawBlock: false,
+    get inLink() { return !!defs._inLink; },
+    set inLink(v) { defs._inLink = !!v; } };
 }
 
 // Fenced code start: ``` or ~~~ (3+), info string after it. A backtick
@@ -1580,6 +2086,31 @@ function endsWithOpenParagraph(ls) {
       if (matchTableDelimiter(line, ind)) { state = 0; idx++; continue; }
       if (isBlockStart(line, ind, true)) {
         const m = matchListMarker(line, ind);
+        // A fence after a paragraph ends the paragraph: skip the
+        // whole fenced block (its content lines are not paragraph
+        // text, so a later lazy line must not be accepted).
+        const fence = matchFence(line, ind);
+        if (fence) {
+          idx++;
+          while (idx < ls.length) {
+            const l2 = ls[idx];
+            const ind2 = countIndent(l2);
+            if (ind2.n <= 3) {
+              const c = fence.ch.charCodeAt(0);
+              let k = ind2.end;
+              let run = 0;
+              while (k < l2.length && l2.charCodeAt(k) === c) { run++; k++; }
+              if (run >= fence.len) {
+                let k2 = k;
+                while (k2 < l2.length && (l2.charCodeAt(k2) === 32 || l2.charCodeAt(k2) === 9)) k2++;
+                if (k2 >= l2.length) { idx++; break; }
+              }
+            }
+            idx++;
+          }
+          state = 0;
+          continue;
+        }
         state = (m && listContentInfo(line, ind, m).indent >= 0) ? 1 : 0;
         idx++;
         continue;
@@ -1631,6 +2162,17 @@ function endsWithOpenParagraph(ls) {
     idx++;
   }
   return state === 1;
+}
+
+// Remove up to `n` leading whitespace CHARACTERS from a fenced code
+// content line (marked's indentCodeCompensation: it slices
+// min(leadingWs.length, fenceIndent.length) characters, so a tab counts
+// as one character, not as a column advance). Only backtick fences get
+// this compensation; tilde fences get none.
+function stripFenceIndent(line, n) {
+  let k = 0;
+  while (k < line.length && k < n && (line.charCodeAt(k) === 32 || line.charCodeAt(k) === 9)) k++;
+  return line.slice(k);
 }
 
 // Remove `n` columns of leading whitespace (a tab that straddles the
@@ -1809,6 +2351,20 @@ function renderIndented(content) {
   return '<pre><code>' + escEncode(r) + '</code></pre>\n';
 }
 
+// Do lines[i..j) (after leading link reference definitions) start
+// with a GFM table header + delimiter row with matching cell counts?
+function isTableRegion(lines, i, j) {
+  const text = lines.slice(i, j).join('\n');
+  const tmp = new Map();
+  const rest = text.slice(stripDefs(text, tmp));
+  const restLines = rest.split('\n');
+  if (restLines.length < 2) return false;
+  const aligns = matchTableDelimiter(restLines[1], countIndent(restLines[1]));
+  if (!aligns) return false;
+  const headerCells = splitCells(restLines[0]);
+  return headerCells.length === aligns.length;
+}
+
 // Collect the lines of a paragraph starting at line `i`: consecutive
 // non-blank lines that do not start an interrupting block. A setext
 // underline line is collected and ends the paragraph.
@@ -1824,6 +2380,11 @@ function collectParagraphLines(lines, i, end, lazy, lastNl, inList) {
       // An empty last line, or one followed by a newline, is a
       // separator and ends the paragraph.
       if (line !== '' && j === end - 1 && lastNl === false) { j++; continue; }
+      // Inside a table body, a whitespace-only line that is not
+      // spaces-only (e.g. a lone tab) is a body row, not a
+      // separator: marked's table body regex excludes only ` *\n`
+      // lines. A spaces-only or empty line still ends the table.
+      if (line !== '' && !/^[ ]+$/.test(line) && isTableRegion(lines, i, j)) { j++; continue; }
       break;
     }
     // A lazy continuation line (from a blockquote) is already known
@@ -1870,9 +2431,11 @@ function renderParagraphRegion(lines, i, j, defs, opts) {
     if (aligns && headerCells && headerCells.length === aligns.length) {
       const body = [];
       let used = 2;
-      // Every following non-blank line is a body row, even one
-      // without pipes (it becomes a single cell, padded empty).
-      while (used < restLines.length && restLines[used].trim() !== '') { body.push(restLines[used]); used++; }
+      // Every following line is a body row, even a whitespace-only
+      // one with a tab (marked's table body excludes only
+      // spaces-only lines); the region already ends at a
+      // spaces-only/empty line or a block start.
+      while (used < restLines.length && !/^[ ]*$/.test(restLines[used])) { body.push(restLines[used]); used++; }
       let html = '<table>\n<thead>\n<tr>\n';
       for (let c = 0; c < headerCells.length; c++) {
         html += aligns[c] ? '<th align="' + aligns[c] + '">' : '<th>';
@@ -1933,6 +2496,20 @@ function isDefLine(line, ind) {
   return parseDef(line, ind.end) !== null;
 }
 
+// Is `stripped` (a line already stripped of the list item's content
+// indent) the closing fence for a fence of `fenceCh`/`fenceLen`?
+function isFenceClose(stripped, fenceCh, fenceLen) {
+  const ind = countIndent(stripped);
+  if (ind.n > 3) return false;
+  const c = fenceCh.charCodeAt(0);
+  let k = ind.end;
+  let run = 0;
+  while (k < stripped.length && stripped.charCodeAt(k) === c) { run++; k++; }
+  if (run < fenceLen) return false;
+  while (k < stripped.length && (stripped.charCodeAt(k) === 32 || stripped.charCodeAt(k) === 9)) k++;
+  return k >= stripped.length;
+}
+
 function collectListItems(lines, i, end, firstInd, firstMarker, lastNl) {
   const ordered = firstMarker.ordered;
   const items = [];
@@ -1957,13 +2534,55 @@ function collectListItems(lines, i, end, firstInd, firstMarker, lastNl) {
     const itemLines = [];
     const itemLazy = new Set();
     let lastContentOrig = -1;
+    // A fenced code block inside an item swallows its content lines
+    // regardless of their indent — but only once the fence has real
+    // content and the previous line was not blank. A below-indent
+    // line as the fence's first content, or right after a blank
+    // line, ends the item instead (the fence stays empty / ends
+    // there): marked's list loop treats those as non-lazy.
+    let inFence = null;
+    let fenceContent = false;
+    let fenceAfterBlank = false;
     if (ci.indent >= 0) {
-      itemLines.push(' '.repeat(Math.max(0, ci.col - contentIndent)) + line.slice(ci.at));
+      const first = ' '.repeat(Math.max(0, ci.col - contentIndent)) + line.slice(ci.at);
+      itemLines.push(first);
+      const f0 = matchFence(first, countIndent(first));
+      if (f0) inFence = { ch: f0.ch, len: f0.len };
       lastContentOrig = j;
     }
     j++;
     while (j < end) {
       const l2 = lines[j];
+      // Inside a fenced code block: content lines at/above the item
+      // indent are always fence content; a line below the item
+      // indent is fence content only as a lazy continuation (fence
+      // already has content and the previous line was not blank).
+      // Otherwise the line ends the item and the fence with it.
+      if (inFence) {
+        if (isBlank(l2)) {
+          itemLines.push('');
+          fenceAfterBlank = true;
+          lastContentOrig = j;
+          j++;
+          continue;
+        }
+        const stripped = stripColumns(expandLeadingTabs(l2), contentIndent);
+        if (isFenceClose(stripped, inFence.ch, inFence.len)) {
+          itemLines.push(stripped);
+          lastContentOrig = j;
+          j++;
+          inFence = null;
+          continue;
+        }
+        const indF = countIndent(l2);
+        if (indF.n < contentIndent && (!fenceContent || fenceAfterBlank)) break;
+        itemLines.push(stripped);
+        fenceContent = true;
+        fenceAfterBlank = false;
+        lastContentOrig = j;
+        j++;
+        continue;
+      }
       if (isBlank(l2)) {
         let k = j + 1;
         while (k < end && isBlank(lines[k])) k++;
@@ -1990,7 +2609,10 @@ function collectListItems(lines, i, end, firstInd, firstMarker, lastNl) {
       }
       const ind2 = countIndent(l2);
       if (ind2.n >= contentIndent) {
-        itemLines.push(stripColumns(expandTabs(l2, 0), contentIndent));
+        const stripped = stripColumns(expandLeadingTabs(l2), contentIndent);
+        itemLines.push(stripped);
+        const f = matchFence(stripped, countIndent(stripped));
+        if (f) { inFence = { ch: f.ch, len: f.len }; fenceContent = false; fenceAfterBlank = false; }
         lastContentOrig = j;
         j++;
         continue;
@@ -2007,7 +2629,12 @@ function collectListItems(lines, i, end, firstInd, firstMarker, lastNl) {
         const lmContent = lm ? listContentInfo(l2, indL, lm).indent >= 0 : false;
         if (!lmContent && !isBlockStart(l2, indL, true) && !matchSetext(l2, indL) && !matchTableDelimiter(l2, indL) && !isDefLine(l2, indL)) {
           itemLazy.add(itemLines.length);
-          itemLines.push(stripColumns(l2, contentIndent));
+          // A lazy continuation line keeps its leading spaces, except
+          // that a line indented 4+ loses 4 (marked's indented-code
+          // compensation on the paragraph text): e.g. `+ A\n lazy`
+          // keeps the space, `  1.  A\n    with` (cm-291) loses all
+          // four, and `  1.  A\n     with` keeps one.
+          itemLines.push(indL.n >= 4 ? stripColumns(l2, 4) : l2);
           lastContentOrig = j;
           j++;
           continue;
@@ -2064,7 +2691,11 @@ function hasBlankBetweenTopBlocks(lines) {
       const fm = matchListMarker(line, ind);
       next = collectListItems(lines, i, end, ind, fm, false).next;
     } else {
-      next = collectParagraphLines(lines, i, end);
+      // These lines are a list item's content, parsed with inList:
+      // an ordered list with any start number interrupts the
+      // paragraph here, so the blank line inside that nested list
+      // must not count as a blank between this item's top blocks.
+      next = collectParagraphLines(lines, i, end, undefined, undefined, true);
     }
     if (seenBlock && seenBlank) return true;
     seenBlock = true;
@@ -2129,7 +2760,7 @@ function parseBlocks(lines, start, end, defs, opts, lastNl) {
             if (k2 >= l2.length) break;
           }
         }
-        content.push(ind.n > 0 ? stripColumns(l2, ind.n) : l2);
+        content.push(fence.ch === '`' && ind.end > 0 ? stripFenceIndent(l2, ind.end) : l2);
         j++;
       }
       if (!opts.collectOnly) out += renderFenced(fence.info, content);
